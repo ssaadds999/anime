@@ -135,6 +135,43 @@ type ProjectData = {
 };
 
 
+type VideoSubtitleSettings = {
+  maskEnabled: boolean;
+  maskHeight: number;
+  maskBottom: number;
+  maskWidth: number;
+  maskColor: string;
+  maskOpacity: number;
+  maskRadius: number;
+  thaiEnabled: boolean;
+  thaiFontSize: number;
+  thaiFontFamily: string;
+  thaiColor: string;
+  thaiStrokeColor: string;
+  thaiStrokeWidth: number;
+  thaiShadow: boolean;
+  thaiBottom: number;
+};
+
+const DEFAULT_VIDEO_SUBTITLE_SETTINGS: VideoSubtitleSettings = {
+  maskEnabled: true,
+  maskHeight: 10,
+  maskBottom: 4,
+  maskWidth: 94,
+  maskColor: "#000000",
+  maskOpacity: 0.82,
+  maskRadius: 6,
+  thaiEnabled: true,
+  thaiFontSize: 26,
+  thaiFontFamily: "sans-serif",
+  thaiColor: "#ffffff",
+  thaiStrokeColor: "#000000",
+  thaiStrokeWidth: 1.5,
+  thaiShadow: true,
+  thaiBottom: 5,
+};
+
+
 
 
 
@@ -201,6 +238,20 @@ export default function SubtitleTranslator() {
 
   const videoContainerRef = useRef<HTMLDivElement>(null);
 
+  const videoStageRef = useRef<HTMLDivElement>(null);
+
+  const [videoContentRect, setVideoContentRect] = useState({
+    left: 0,
+    top: 0,
+    width: 0,
+    height: 0,
+  });
+
+  const [subtitleSettings, setSubtitleSettings] = useState<VideoSubtitleSettings>(
+    DEFAULT_VIDEO_SUBTITLE_SETTINGS
+  );
+  const [subtitleSettingsHydrated, setSubtitleSettingsHydrated] = useState(false);
+
   const [videoFile, setVideoFile] = useState<File | null>(null);
 
   const [videoUrl, setVideoUrl] = useState("");
@@ -240,8 +291,7 @@ export default function SubtitleTranslator() {
 
 
   const [search, setSearch] = useState("");
-
-
+  const [showAllSubtitles, setShowAllSubtitles] = useState(false);
 
   const [editingId, setEditingId] = useState<number | null>(null);
 
@@ -430,18 +480,105 @@ const translatedCount = Object.keys(translations).length;
 
 
   const activeSubtitle = useMemo(() => {
-
     return entries.find((entry) => {
-
       const start = timestampToSeconds(entry.start);
-
       const end = timestampToSeconds(entry.end);
-
       return videoTime >= start && videoTime <= end;
-
     });
-
   }, [entries, videoTime]);
+
+
+  // Measure the actual video picture area (not the player/container letterbox).
+  // This keeps the mask and Thai text aligned for 16:9, 4:3 and fullscreen layouts.
+  useEffect(() => {
+    const video = videoRef.current;
+    const stage = videoStageRef.current;
+    if (!video || !stage) {
+      setVideoContentRect({ left: 0, top: 0, width: 0, height: 0 });
+      return;
+    }
+
+    const measureVideoContent = () => {
+      const stageRect = stage.getBoundingClientRect();
+      const videoRect = video.getBoundingClientRect();
+      const sourceWidth = video.videoWidth;
+      const sourceHeight = video.videoHeight;
+
+      if (!sourceWidth || !sourceHeight || !videoRect.width || !videoRect.height) {
+        setVideoContentRect({ left: 0, top: 0, width: 0, height: 0 });
+        return;
+      }
+
+      const scale = Math.min(
+        videoRect.width / sourceWidth,
+        videoRect.height / sourceHeight
+      );
+      const width = sourceWidth * scale;
+      const height = sourceHeight * scale;
+      const left = videoRect.left - stageRect.left + (videoRect.width - width) / 2;
+      const top = videoRect.top - stageRect.top + (videoRect.height - height) / 2;
+
+      setVideoContentRect((previous) => {
+        if (
+          Math.abs(previous.left - left) < 0.5 &&
+          Math.abs(previous.top - top) < 0.5 &&
+          Math.abs(previous.width - width) < 0.5 &&
+          Math.abs(previous.height - height) < 0.5
+        ) return previous;
+        return { left, top, width, height };
+      });
+    };
+
+    measureVideoContent();
+    const observer = new ResizeObserver(measureVideoContent);
+    observer.observe(stage);
+    observer.observe(video);
+    video.addEventListener("loadedmetadata", measureVideoContent);
+    video.addEventListener("loadeddata", measureVideoContent);
+    window.addEventListener("resize", measureVideoContent);
+    document.addEventListener("fullscreenchange", measureVideoContent);
+
+    return () => {
+      observer.disconnect();
+      video.removeEventListener("loadedmetadata", measureVideoContent);
+      video.removeEventListener("loadeddata", measureVideoContent);
+      window.removeEventListener("resize", measureVideoContent);
+      document.removeEventListener("fullscreenchange", measureVideoContent);
+    };
+  }, [videoUrl]);
+
+  // Restore subtitle appearance preferences from this browser.
+  useEffect(() => {
+    try {
+      const savedSettings = localStorage.getItem("anime-subtitle-translator-video-settings-v1");
+      if (savedSettings) {
+        const parsed = JSON.parse(savedSettings) as Partial<VideoSubtitleSettings>;
+        setSubtitleSettings({ ...DEFAULT_VIDEO_SUBTITLE_SETTINGS, ...parsed });
+      }
+    } catch (storageError) {
+      console.warn("Unable to load subtitle settings", storageError);
+    } finally {
+      setSubtitleSettingsHydrated(true);
+    }
+  }, []);
+
+  // Save every adjustment so it is restored the next time the app is opened.
+  useEffect(() => {
+    if (!subtitleSettingsHydrated) return;
+    try {
+      localStorage.setItem(
+        "anime-subtitle-translator-video-settings-v1",
+        JSON.stringify(subtitleSettings)
+      );
+    } catch (storageError) {
+      console.warn("Unable to save subtitle settings", storageError);
+    }
+  }, [subtitleSettings, subtitleSettingsHydrated]);
+
+  function updateSubtitleSettings(patch: Partial<VideoSubtitleSettings>) {
+    setSubtitleSettings((previous) => ({ ...previous, ...patch }));
+  }
+
 
 
 
@@ -1041,11 +1178,9 @@ const translatedCount = Object.keys(translations).length;
 
   }, [entries, translations, search]);
 
-
-
-
-
-
+  const visibleEntries = showAllSubtitles || search.trim()
+    ? filteredEntries
+    : filteredEntries.slice(0, 6);
 
   function handleVideoFile(file?: File) {
 
@@ -1604,19 +1739,49 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-    <main className="min-h-screen bg-[#09090f] p-4 text-white md:p-8">
+    <main className="studio-page min-h-screen w-full overflow-x-hidden px-3 py-5 text-white sm:px-6 sm:py-7 lg:px-10 lg:py-10">
 
 
 
-      <div className="mx-auto max-w-6xl">
+      <style>{`
+        .studio-page {
+          background:
+            radial-gradient(ellipse at 12% 0%, rgba(124,58,237,.19), transparent 34rem),
+            radial-gradient(ellipse at 92% 12%, rgba(79,70,229,.12), transparent 30rem),
+            #080810;
+        }
+        .studio-page > div { max-width: 1580px; }
+        .studio-page header { position: relative; padding: 1.4rem 1.5rem; border: 1px solid rgba(167,139,250,.16); border-radius: 1.5rem; background: linear-gradient(115deg, rgba(35,24,62,.82), rgba(17,17,29,.88) 58%, rgba(18,18,30,.72)); box-shadow: 0 18px 55px rgba(0,0,0,.22); overflow: hidden; }
+        .studio-page header:after { content: ""; position:absolute; width:18rem; height:18rem; right:-5rem; top:-9rem; border-radius:999px; background:rgba(139,92,246,.12); filter:blur(12px); pointer-events:none; }
+        .studio-page header h1 { letter-spacing:-.045em; }
+        .studio-page section.rounded-2xl { border-color:rgba(167,139,250,.16); background:linear-gradient(145deg,rgba(22,21,37,.96),rgba(13,13,23,.98)); box-shadow:0 16px 45px rgba(0,0,0,.18); }
+        .studio-page button { transition:background-color .18s ease,border-color .18s ease,transform .18s ease,box-shadow .18s ease; }
+        .studio-page button:not(:disabled):hover { transform:translateY(-1px); }
+        .studio-page input:not([type=range]):not([type=checkbox]):not([type=color]),
+        .studio-page textarea,.studio-page select { transition:border-color .18s ease,box-shadow .18s ease; }
+        .studio-page input:focus,.studio-page textarea:focus,.studio-page select:focus { box-shadow:0 0 0 3px rgba(139,92,246,.12); }
+        .video-player-shell { border:1px solid rgba(167,139,250,.22); box-shadow:0 18px 55px rgba(0,0,0,.4); }
+        .video-player-stage { min-height:220px; }
+        .video-player-shell:fullscreen { width:100vw; height:100dvh; max-width:none; border:0; border-radius:0; background:#000; display:flex; align-items:center; justify-content:center; }
+        .video-player-shell:fullscreen .video-player-stage { width:100%; height:100%; min-height:0; max-height:100dvh; aspect-ratio:auto; }
+        .video-player-shell:fullscreen .video-player-element { width:100%; height:100%; max-height:none; object-fit:contain; }
+        .video-player-shell:fullscreen .video-fullscreen-toggle { display:none; }
+        .video-player-shell:fullscreen .video-player-stage { cursor:default; }
+        @media (max-width: 640px) {
+          .studio-page header { padding:1.15rem; border-radius:1.2rem; }
+          .video-player-stage { min-height:190px; }
+          .video-player-shell:fullscreen .video-player-stage { min-height:0; }
+        }
+      `}</style>
+      <div className="mx-auto w-full max-w-screen-2xl">
 
 
 
-        <header className="mb-7">
+        <header className="mb-6 sm:mb-8">
 
 
 
-          <div className="mb-3 flex items-center gap-2 text-violet-400">
+          <div className="relative z-10 mb-3 inline-flex items-center gap-2 rounded-full border border-violet-400/20 bg-violet-400/10 px-3 py-1.5 text-violet-300">
 
 
 
@@ -1632,11 +1797,11 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-          <h1 className="text-3xl font-bold">Subtitle Studio</h1>
+          <h1 className="relative z-10 text-3xl font-black tracking-tight sm:text-4xl lg:text-5xl">Subtitle <span className="bg-gradient-to-r from-violet-300 via-fuchsia-300 to-indigo-300 bg-clip-text text-transparent">Studio</span></h1>
 
 
 
-          <p className="mt-2 text-sm text-gray-400">แปล แก้ไข และจัดการซับอนิเมะด้วย AI</p>
+          <p className="relative z-10 mt-3 max-w-xl text-sm leading-6 text-slate-400 sm:text-base">แปล แก้ไข และจัดการซับอนิเมะด้วย AI ในพื้นที่ทำงานเดียว พร้อมระบบจดจำคำศัพท์และตัวละคร</p>
 
 
 
@@ -1652,7 +1817,7 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-        <section className="mb-6 rounded-2xl border border-violet-500/20 bg-[#12121c] p-5">
+        <section className="mb-6 rounded-2xl border border-violet-500/20 bg-[#12121c] p-3 shadow-xl shadow-black/10 sm:p-5">
 
 
 
@@ -2310,7 +2475,7 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-            <section className="mb-6 rounded-2xl border border-white/10 bg-[#12121c] p-5">
+            <section className="mb-6 rounded-2xl border border-white/10 bg-[#12121c] p-3 shadow-xl shadow-black/10 sm:p-5">
 
 
 
@@ -2362,7 +2527,7 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-              <section className="mt-5 rounded-xl border border-white/10 bg-black/20 p-4">
+              <section className="mt-5 rounded-xl border border-white/10 bg-black/20 p-3 sm:p-4">
 
                 <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
 
@@ -2424,12 +2589,7 @@ const translatedCount = Object.keys(translations).length;
 
                     )}
 
-<button
-  onClick={toggleVideoFullscreen}
-  className="rounded-lg border border-gray-700 px-3 py-2 text-sm hover:bg-gray-800"
->
-  เต็มจอ
-</button>
+
                   </div>
 
                 </div>
@@ -2441,35 +2601,79 @@ const translatedCount = Object.keys(translations).length;
                   <>
 
                     <div
-  ref={videoContainerRef}
-  className="relative overflow-hidden rounded-lg bg-black [&:fullscreen]:flex [&:fullscreen]:h-screen [&:fullscreen]:w-screen [&:fullscreen]:items-center [&:fullscreen]:justify-center"
->
+                      ref={videoContainerRef}
+                      className="video-player-shell relative w-full overflow-hidden rounded-lg bg-black"
+                    >
+                      <div
+                        ref={videoStageRef}
+                        className="video-player-stage relative flex aspect-video w-full items-center justify-center bg-black"
+                      >
+                        <video
+                          ref={videoRef}
+                          src={videoUrl}
+                          controls
+                          controlsList="nofullscreen"
+                          playsInline
+                          className="video-player-element block h-full max-h-[min(76vh,900px)] w-full object-contain"
+                          onLoadedMetadata={() => {
+                            const video = videoRef.current;
+                            if (video) setVideoTime(video.currentTime);
+                          }}
+                          onTimeUpdate={(event) => setVideoTime(event.currentTarget.currentTime)}
+                          onRateChange={(event) => setPlaybackRate(event.currentTarget.playbackRate)}
+                        />
 
-                     <video
-  ref={videoRef}
-  src={videoUrl}
-  controls
-  controlsList="nofullscreen"
-  playsInline
-  className="block max-h-full w-full object-contain"
-  onTimeUpdate={(event) => setVideoTime(event.currentTarget.currentTime)}
-  onRateChange={(event) => setPlaybackRate(event.currentTarget.playbackRate)}
-/>
+                        <button
+                          type="button"
+                          onClick={toggleVideoFullscreen}
+                          aria-label="เปิดโหมดเต็มจอ"
+                          title="ขยายวิดีโอเต็มหน้าจอ"
+                          className="video-fullscreen-toggle absolute right-3 top-3 z-40 rounded-lg border border-white/15 bg-black/65 px-3 py-2 text-xs font-medium text-white shadow-lg backdrop-blur transition hover:bg-violet-700/80 sm:text-sm"
+                        >
+                          เต็มจอ
+                        </button>
 
-                      {activeSubtitle && (
+                        {videoContentRect.width > 0 && videoContentRect.height > 0 && subtitleSettings.maskEnabled && (
+                          <div
+                            aria-hidden="true"
+                            className="pointer-events-none absolute z-10"
+                            style={{
+                              left: videoContentRect.left + videoContentRect.width * (1 - subtitleSettings.maskWidth / 100) / 2,
+                              top: videoContentRect.top + videoContentRect.height * (1 - subtitleSettings.maskBottom / 100 - subtitleSettings.maskHeight / 100),
+                              width: videoContentRect.width * subtitleSettings.maskWidth / 100,
+                              height: videoContentRect.height * subtitleSettings.maskHeight / 100,
+                              backgroundColor: subtitleSettings.maskColor,
+                              opacity: subtitleSettings.maskOpacity,
+                              borderRadius: `${subtitleSettings.maskRadius}px`,
+                            }}
+                          />
+                        )}
 
-                        <div className="pointer-events-none absolute bottom-14 left-3 right-3 flex justify-center px-3 text-center">
-
-                          <span className="max-w-4xl rounded-md bg-black/75 px-3 py-2 text-base font-semibold leading-relaxed text-white shadow-lg [text-shadow:0_1px_3px_#000] md:text-xl">
-
-                            {translations[activeSubtitle.id] || activeSubtitle.text}
-
-                          </span>
-
-                        </div>
-
-                      )}
-
+                        {activeSubtitle && subtitleSettings.thaiEnabled && videoContentRect.width > 0 && (
+                          <div
+                            className="pointer-events-none absolute z-20 flex justify-center px-2 text-center"
+                            style={{
+                              left: videoContentRect.left,
+                              width: videoContentRect.width,
+                              bottom: `calc(100% - ${videoContentRect.top + videoContentRect.height}px + ${videoContentRect.height * subtitleSettings.thaiBottom / 100}px)`,
+                            }}
+                          >
+                            <span
+                              className="max-w-full whitespace-pre-wrap rounded-md px-3 py-1.5 font-semibold leading-relaxed"
+                              style={{
+                                fontFamily: subtitleSettings.thaiFontFamily,
+                                fontSize: `${subtitleSettings.thaiFontSize}px`,
+                                color: subtitleSettings.thaiColor,
+                                WebkitTextStroke: `${subtitleSettings.thaiStrokeWidth}px ${subtitleSettings.thaiStrokeColor}`,
+                                paintOrder: "stroke fill",
+                                textShadow: subtitleSettings.thaiShadow ? "0 2px 4px rgba(0,0,0,0.95)" : "none",
+                              }}
+                            >
+                              {translations[activeSubtitle.id] || activeSubtitle.text}
+                            </span>
+                          </div>
+                        )}
+                      </div>
                     </div>
 
                     <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-gray-400">
@@ -2505,6 +2709,88 @@ const translatedCount = Object.keys(translations).length;
                     </div>
 
                     <p className="mt-2 text-xs text-amber-300/80">หมายเหตุ: MP4 และ WebM รองรับได้ดีที่สุด ส่วน MKV อาจเล่นไม่ได้ขึ้นอยู่กับ Codec และเบราว์เซอร์</p>
+
+                    <div className="mt-4 rounded-xl border border-violet-500/20 bg-[#11111b] p-4">
+                      <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <h4 className="text-sm font-semibold text-violet-200">Subtitle Display Settings</h4>
+                          <p className="mt-1 text-xs text-gray-500">ปรับแถบบังซับอังกฤษและรูปแบบซับไทยบนภาพวิดีโอ</p>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => setSubtitleSettings(DEFAULT_VIDEO_SUBTITLE_SETTINGS)}
+                          className="rounded-lg border border-white/10 px-3 py-2 text-xs hover:bg-white/10"
+                        >
+                          Reset ค่าเริ่มต้น
+                        </button>
+                      </div>
+
+                      <div className="grid gap-4 lg:grid-cols-2">
+                        <div className="space-y-3 rounded-lg border border-white/10 bg-black/20 p-3">
+                          <label className="flex items-center justify-between gap-3 text-sm font-medium">
+                            <span>ปิดบังซับอังกฤษ (English Mask)</span>
+                            <input type="checkbox" checked={subtitleSettings.maskEnabled} onChange={(event) => updateSubtitleSettings({ maskEnabled: event.target.checked })} className="h-4 w-4 accent-violet-500" />
+                          </label>
+                          <label className="block text-xs text-gray-300">ความสูง: {subtitleSettings.maskHeight}%
+                            <input type="range" min="3" max="25" step="1" value={subtitleSettings.maskHeight} onChange={(event) => updateSubtitleSettings({ maskHeight: Number(event.target.value) })} className="mt-2 w-full accent-violet-500" />
+                          </label>
+                          <label className="block text-xs text-gray-300">ตำแหน่งจากขอบล่าง: {subtitleSettings.maskBottom}%
+                            <input type="range" min="0" max="30" step="1" value={subtitleSettings.maskBottom} onChange={(event) => updateSubtitleSettings({ maskBottom: Number(event.target.value) })} className="mt-2 w-full accent-violet-500" />
+                          </label>
+                          <label className="block text-xs text-gray-300">ความกว้าง: {subtitleSettings.maskWidth}%
+                            <input type="range" min="40" max="100" step="1" value={subtitleSettings.maskWidth} onChange={(event) => updateSubtitleSettings({ maskWidth: Number(event.target.value) })} className="mt-2 w-full accent-violet-500" />
+                          </label>
+                          <div className="grid grid-cols-2 gap-3">
+                            <label className="text-xs text-gray-300">สีพื้นหลัง
+                              <input type="color" value={subtitleSettings.maskColor} onChange={(event) => updateSubtitleSettings({ maskColor: event.target.value })} className="mt-1 h-9 w-full cursor-pointer rounded border border-white/10 bg-transparent" />
+                            </label>
+                            <label className="text-xs text-gray-300">มุมโค้ง: {subtitleSettings.maskRadius}px
+                              <input type="range" min="0" max="24" value={subtitleSettings.maskRadius} onChange={(event) => updateSubtitleSettings({ maskRadius: Number(event.target.value) })} className="mt-2 w-full accent-violet-500" />
+                            </label>
+                          </div>
+                          <label className="block text-xs text-gray-300">ความทึบ: {Math.round(subtitleSettings.maskOpacity * 100)}%
+                            <input type="range" min="0" max="1" step="0.05" value={subtitleSettings.maskOpacity} onChange={(event) => updateSubtitleSettings({ maskOpacity: Number(event.target.value) })} className="mt-2 w-full accent-violet-500" />
+                          </label>
+                        </div>
+
+                        <div className="space-y-3 rounded-lg border border-white/10 bg-black/20 p-3">
+                          <label className="flex items-center justify-between gap-3 text-sm font-medium">
+                            <span>แสดงซับไทย (Thai Subtitle)</span>
+                            <input type="checkbox" checked={subtitleSettings.thaiEnabled} onChange={(event) => updateSubtitleSettings({ thaiEnabled: event.target.checked })} className="h-4 w-4 accent-violet-500" />
+                          </label>
+                          <label className="block text-xs text-gray-300">ขนาดตัวอักษร: {subtitleSettings.thaiFontSize}px
+                            <input type="range" min="14" max="48" step="1" value={subtitleSettings.thaiFontSize} onChange={(event) => updateSubtitleSettings({ thaiFontSize: Number(event.target.value) })} className="mt-2 w-full accent-violet-500" />
+                          </label>
+                          <label className="block text-xs text-gray-300">ตำแหน่งจากขอบล่าง: {subtitleSettings.thaiBottom}%
+                            <input type="range" min="0" max="25" step="1" value={subtitleSettings.thaiBottom} onChange={(event) => updateSubtitleSettings({ thaiBottom: Number(event.target.value) })} className="mt-2 w-full accent-violet-500" />
+                          </label>
+                          <label className="block text-xs text-gray-300">ฟอนต์
+                            <select value={subtitleSettings.thaiFontFamily} onChange={(event) => updateSubtitleSettings({ thaiFontFamily: event.target.value })} className="mt-1 w-full rounded border border-white/10 bg-[#12121c] px-2 py-2 text-white">
+                              <option value="sans-serif">Sans-serif</option>
+                              <option value="Arial, sans-serif">Arial</option>
+                              <option value="Tahoma, sans-serif">Tahoma</option>
+                              <option value="serif">Serif</option>
+                              <option value="monospace">Monospace</option>
+                            </select>
+                          </label>
+                          <div className="grid grid-cols-2 gap-3">
+                            <label className="text-xs text-gray-300">สีตัวอักษร
+                              <input type="color" value={subtitleSettings.thaiColor} onChange={(event) => updateSubtitleSettings({ thaiColor: event.target.value })} className="mt-1 h-9 w-full cursor-pointer rounded border border-white/10 bg-transparent" />
+                            </label>
+                            <label className="text-xs text-gray-300">สีขอบ
+                              <input type="color" value={subtitleSettings.thaiStrokeColor} onChange={(event) => updateSubtitleSettings({ thaiStrokeColor: event.target.value })} className="mt-1 h-9 w-full cursor-pointer rounded border border-white/10 bg-transparent" />
+                            </label>
+                          </div>
+                          <label className="block text-xs text-gray-300">ความหนาขอบ: {subtitleSettings.thaiStrokeWidth}px
+                            <input type="range" min="0" max="5" step="0.5" value={subtitleSettings.thaiStrokeWidth} onChange={(event) => updateSubtitleSettings({ thaiStrokeWidth: Number(event.target.value) })} className="mt-2 w-full accent-violet-500" />
+                          </label>
+                          <label className="flex items-center justify-between gap-3 text-xs text-gray-300">
+                            <span>เปิดเงาตัวอักษร</span>
+                            <input type="checkbox" checked={subtitleSettings.thaiShadow} onChange={(event) => updateSubtitleSettings({ thaiShadow: event.target.checked })} className="h-4 w-4 accent-violet-500" />
+                          </label>
+                        </div>
+                      </div>
+                    </div>
 
                   </>
 
@@ -2565,13 +2851,6 @@ const translatedCount = Object.keys(translations).length;
 
               </div>
 
-<button
-  type="button"
-  onClick={toggleVideoFullscreen}
-  className="absolute right-3 top-3 z-50 rounded-lg bg-black/70 px-3 py-2 text-sm text-white"
->
-  เต็มจอ
-</button>
 
 
               {loading && <div className="mt-5 h-2 overflow-hidden rounded-full bg-white/10"><div className="h-full rounded-full bg-violet-500 transition-all" style={{ width: `${progress}%` }} /></div>}
@@ -2594,114 +2873,63 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-            <section>
-
-
-
-              <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-
-
-
-                <h2 className="text-xl font-bold">Subtitle Editor</h2>
-
-
-
-                <div className="relative w-full md:w-72"><Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" size={18} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="ค้นหาซับ..." className="w-full rounded-xl border border-white/10 bg-[#12121c] py-3 pl-10 pr-4 text-sm outline-none focus:border-violet-500" /></div>
-
-
-
+            <section className="overflow-hidden rounded-2xl border border-violet-300/10 bg-gradient-to-b from-[#171522] to-[#101018] shadow-[0_18px_50px_rgba(0,0,0,.22)]">
+              <div className="flex flex-col gap-3 border-b border-white/[0.07] p-4 sm:flex-row sm:items-center sm:justify-between sm:px-5">
+                <div className="flex items-center gap-3">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-violet-500/15 text-violet-300"><FileText size={19} /></div>
+                  <div>
+                    <h2 className="text-lg font-bold tracking-tight">Subtitle Editor</h2>
+                    <p className="text-xs text-gray-500">{filteredEntries.length} รายการ · แปลแล้ว {translatedCount} รายการ</p>
+                  </div>
+                </div>
+                <div className="relative w-full sm:w-72">
+                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500" size={16} />
+                  <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="ค้นหาข้อความหรือคำแปล..." className="w-full rounded-xl border border-white/10 bg-black/25 py-2.5 pl-9 pr-3 text-sm outline-none transition focus:border-violet-500" />
+                </div>
               </div>
 
-
-
-              <div className="space-y-3">
-
-
-
-                {filteredEntries.map((entry) => {
-
-
-
-                  const translated = translations[entry.id] ?? "";
-
-
-
-                  const isEditing = editingId === entry.id;
-
-
-
-                  return (
-
-
-
-                    <article key={entry.id} className="rounded-xl border border-white/10 bg-[#12121c] p-4">
-
-
-
-                      <div className="mb-3 flex items-center justify-between">
-
-
-
-                        <div className="flex items-center gap-2"><span className="rounded-md bg-violet-500/15 px-2 py-1 text-xs text-violet-300">#{entry.id}</span><span className="text-xs text-gray-500">{entry.start} → {entry.end}</span></div>
-
-
-
-                        {translated && <button onClick={() => setEditingId(isEditing ? null : entry.id)} className="flex items-center gap-1 text-xs text-violet-400 hover:text-violet-300"><Pencil size={14} />{isEditing ? "เสร็จ" : "แก้ไข"}</button>}
-
-
-
-                      </div>
-
-
-
-                      <p className="mb-2 text-xs font-semibold text-gray-500">ORIGINAL</p>
-
-
-
-                      <p className="whitespace-pre-wrap text-sm leading-7 text-gray-300">{entry.text}</p>
-
-
-
-                      <div className="mt-4 border-t border-white/10 pt-4">
-
-
-
-                        <p className="mb-2 text-xs font-semibold text-violet-400">THAI TRANSLATION</p>
-
-
-
-                        {isEditing ? <textarea autoFocus value={translated} onChange={(event) => updateTranslation(entry.id, event.target.value)} rows={3} className="w-full rounded-xl border border-violet-500/40 bg-black/30 p-3 text-sm leading-7 text-white outline-none focus:border-violet-400" placeholder="พิมพ์คำแปลภาษาไทย..." /> : <p className={`whitespace-pre-wrap text-sm leading-7 ${translated ? "text-green-300" : "text-gray-600"}`}>{translated || "ยังไม่ได้แปล"}</p>}
-
-
-
-                        {translated && !isEditing && <button onClick={() => setEditingId(entry.id)} className="mt-2 flex items-center gap-1 text-xs text-gray-500 hover:text-white"><Pencil size={12} /> แก้คำแปล</button>}
-
-
-
-                      </div>
-
-
-
-                    </article>
-
-
-
-                  );
-
-
-
-                })}
-
-
-
-              </div>
-
-
-
-              {filteredEntries.length === 0 && <div className="rounded-xl bg-[#12121c] p-8 text-center text-gray-500">ไม่พบข้อความที่ค้นหา</div>}
-
-
-
+              {filteredEntries.length > 0 ? (
+                <>
+                  <div className={`space-y-2.5 p-3 sm:p-4 ${showAllSubtitles && !search.trim() ? "max-h-[70vh] overflow-y-auto" : ""}`}>
+                    {visibleEntries.map((entry) => {
+                      const translated = translations[entry.id] ?? "";
+                      const isEditing = editingId === entry.id;
+                      return (
+                        <article key={entry.id} className="group rounded-xl border border-white/[0.07] bg-black/20 p-3 transition hover:border-violet-400/25 hover:bg-white/[0.025] sm:p-4">
+                          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                            <div className="flex items-center gap-2">
+                              <span className="rounded-md bg-violet-500/15 px-2 py-1 text-[11px] font-semibold text-violet-300">#{entry.id}</span>
+                              <span className="text-[11px] tabular-nums text-gray-500">{entry.start} → {entry.end}</span>
+                            </div>
+                            {translated && <button onClick={() => setEditingId(isEditing ? null : entry.id)} className="flex items-center gap-1 rounded-lg px-2 py-1 text-xs text-violet-300 transition hover:bg-violet-500/10"> <Pencil size={13} />{isEditing ? "เสร็จ" : "แก้ไข"}</button>}
+                          </div>
+                          <div className="grid gap-3 md:grid-cols-2 md:gap-4">
+                            <div className="min-w-0">
+                              <p className="mb-1.5 text-[10px] font-bold tracking-[.14em] text-gray-500">ORIGINAL</p>
+                              <p className="whitespace-pre-wrap break-words text-sm leading-6 text-gray-300">{entry.text}</p>
+                            </div>
+                            <div className="min-w-0 border-t border-white/[0.06] pt-3 md:border-l md:border-t-0 md:pl-4 md:pt-0">
+                              <p className="mb-1.5 text-[10px] font-bold tracking-[.14em] text-violet-300">THAI TRANSLATION</p>
+                              {isEditing ? <textarea autoFocus value={translated} onChange={(event) => updateTranslation(entry.id, event.target.value)} rows={3} className="w-full rounded-xl border border-violet-500/40 bg-black/30 p-3 text-sm leading-6 text-white outline-none focus:border-violet-400" placeholder="พิมพ์คำแปลภาษาไทย..." /> : <p className={`whitespace-pre-wrap break-words text-sm leading-6 ${translated ? "text-green-300" : "text-gray-600"}`}>{translated || "ยังไม่ได้แปล"}</p>}
+                              {translated && !isEditing && <button onClick={() => setEditingId(entry.id)} className="mt-2 flex items-center gap-1 text-[11px] text-gray-500 transition hover:text-white"><Pencil size={11} /> แก้คำแปล</button>}
+                            </div>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                  {!search.trim() && filteredEntries.length > 6 && (
+                    <div className="border-t border-white/[0.07] px-4 py-3 text-center">
+                      <button onClick={() => setShowAllSubtitles((value) => !value)} className="rounded-lg border border-violet-400/20 bg-violet-500/10 px-4 py-2 text-xs font-medium text-violet-200 transition hover:bg-violet-500/20">
+                        {showAllSubtitles ? "ย่อรายการ" : `แสดงซับทั้งหมด (${filteredEntries.length} รายการ)`}
+                      </button>
+                      {!showAllSubtitles && <p className="mt-1.5 text-[10px] text-gray-600">แสดง 6 รายการแรก เพื่อลดความยาวของหน้า</p>}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="p-8 text-center text-sm text-gray-500">{entries.length ? "ไม่พบข้อความที่ค้นหา" : "ยังไม่มีซับไตเติลให้แก้ไข — เพิ่มไฟล์ SRT แล้วเริ่มแปลได้เลย"}</div>
+              )}
             </section>
 
 
