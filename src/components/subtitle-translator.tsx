@@ -1,8 +1,11 @@
 "use client";
 
+import {
+  getVideoSettings,
+  saveVideoSettings,
+} from "@/lib/database/video-settings";
 
-
-
+import { createClient } from "@/lib/supabase/client";
 
 
 
@@ -303,6 +306,7 @@ export default function SubtitleTranslator() {
 
   const [projectName, setProjectName] = useState("โปรเจกต์ใหม่");
 
+  const [animeIds, setAnimeIds] = useState<Record<string, string>>({});
 
 
   const [projects, setProjects] = useState<Record<string, ProjectData>>({
@@ -347,6 +351,168 @@ export default function SubtitleTranslator() {
 
 const activeProject = projects[projectName] ?? EMPTY_PROJECT;
 const savedEpisodes = activeProject.episodes ?? [];
+
+  useEffect(() => {
+    const animeId = animeIds[projectName];
+
+    if (!hydrated || !animeId) return;
+
+    let cancelled = false;
+
+    async function loadProjectMemory() {
+      try {
+        const supabase = createClient();
+
+        const [charactersResult, glossaryResult, seasonsResult] = await Promise.all([
+          supabase
+            .from("characters")
+            .select("*")
+            .eq("anime_id", animeId),
+          supabase
+            .from("glossary")
+            .select("*")
+            .eq("anime_id", animeId),
+          supabase
+            .from("seasons")
+            .select("id")
+            .eq("anime_id", animeId),
+        ]);
+
+        if (charactersResult.error) throw charactersResult.error;
+        if (glossaryResult.error) throw glossaryResult.error;
+        if (seasonsResult.error) throw seasonsResult.error;
+
+        const seasonIds = (seasonsResult.data ?? []).map((season) => season.id);
+        let episodes: SavedEpisode[] = [];
+
+        if (seasonIds.length > 0) {
+          const { data: episodeRows, error: episodesError } = await supabase
+            .from("episodes")
+            .select("*")
+            .in("season_id", seasonIds)
+            .order("episode_number", { ascending: true });
+
+          if (episodesError) throw episodesError;
+
+          const episodeIds = (episodeRows ?? []).map((episode) => episode.id);
+          let subtitleRows: Array<{
+            episode_id: string;
+            subtitle_number: number;
+            start_time: string;
+            end_time: string;
+            original_text: string;
+            translated_text: string | null;
+          }> = [];
+
+          if (episodeIds.length > 0) {
+            const { data, error: subtitlesError } = await supabase
+              .from("subtitles")
+              .select("episode_id, subtitle_number, start_time, end_time, original_text, translated_text")
+              .in("episode_id", episodeIds)
+              .order("subtitle_number", { ascending: true });
+
+            if (subtitlesError) throw subtitlesError;
+            subtitleRows = data ?? [];
+          }
+
+          episodes = (episodeRows ?? []).map((episode) => {
+            const rows = subtitleRows.filter((row) => row.episode_id === episode.id);
+            const entries: SubtitleEntry[] = rows.map((row) => ({
+              id: Number(row.subtitle_number),
+              start: row.start_time,
+              end: row.end_time,
+              text: row.original_text ?? "",
+            }));
+            const translations: Record<number, string> = {};
+            for (const row of rows) {
+              translations[Number(row.subtitle_number)] = row.translated_text ?? "";
+            }
+
+            return {
+              id: episode.id,
+              title: episode.title ?? "ไม่มีชื่อตอน",
+              fileName: episode.file_name ?? `${episode.title ?? "episode"}.srt`,
+              entries,
+              translations,
+              savedAt: episode.saved_at ?? episode.created_at ?? "",
+            };
+          });
+        }
+
+        if (cancelled) return;
+
+        const characters: Character[] = (charactersResult.data ?? []).map(
+          (item) => ({
+            id: item.id,
+            name: item.name ?? "",
+            description: item.description ?? "",
+            pronoun: item.pronoun ?? "",
+            speakingStyle: item.speech_style ?? "",
+            relationships: item.relationships ?? "",
+          })
+        );
+
+        const glossary: GlossaryItem[] = (glossaryResult.data ?? []).map(
+          (item) => ({
+            id: item.id,
+            original: item.source_term ?? "",
+            translation: item.translated_term ?? "",
+            note: item.note ?? "",
+          })
+        );
+
+        setProjects((previous) => ({
+          ...previous,
+          [projectName]: {
+            ...(previous[projectName] ?? EMPTY_PROJECT),
+            characters,
+            glossary,
+            episodes,
+          },
+        }));
+      } catch (err) {
+        console.error("Load project memory error:", err);
+
+        if (!cancelled) {
+          setError("ไม่สามารถโหลดข้อมูลตัวละครและคลังคำศัพท์ได้");
+        }
+      }
+    }
+
+    loadProjectMemory();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [projectName, animeIds, hydrated]);
+
+
+  useEffect(() => {
+    const animeId = animeIds[projectName];
+
+    if (!hydrated || !animeId) return;
+
+    const timer = setTimeout(async () => {
+      try {
+        const supabase = createClient();
+
+        const { error } = await supabase
+          .from("animes")
+          .update({
+            story_context: activeProject.context,
+          })
+          .eq("id", animeId);
+
+        if (error) throw error;
+      } catch (err) {
+        console.error("Save anime context error:", err);
+        setError("บันทึกบริบทอนิเมะไม่สำเร็จ");
+      }
+    }, 700);
+
+    return () => clearTimeout(timer);
+  }, [activeProject.context, projectName, animeIds, hydrated]);
+
 const translatedCount = Object.keys(translations).length;
 
 
@@ -355,101 +521,71 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-  useEffect(() => {
+  // Load anime projects from Supabase.
+useEffect(() => {
+  let cancelled = false;
 
-
-
+  async function loadProjects() {
     try {
+      const supabase = createClient();
 
+      const { data, error } = await supabase
+        .from("animes")
+        .select("id, title, story_context")
+        .order("created_at", { ascending: true });
 
+      if (error) throw error;
 
-      const saved = localStorage.getItem(STORAGE_KEY);
+      if (cancelled) return;
 
+      const nextProjects: Record<string, ProjectData> = {};
+      const nextAnimeIds: Record<string, string> = {};
 
+      for (const anime of data ?? []) {
+        let key = anime.title;
+        let suffix = 2;
 
-      if (saved) {
-
-
-
-        const parsed = JSON.parse(saved) as {
-
-
-
-          currentProject?: string;
-
-
-
-          projects?: Record<string, ProjectData>;
-
-
-
-        };
-
-
-
-        if (parsed.projects && Object.keys(parsed.projects).length > 0) {
-
-
-
-          const normalizedProjects = Object.fromEntries(
-            Object.entries(parsed.projects).map(([name, project]) => [
-              name,
-              { ...EMPTY_PROJECT, ...project, episodes: project.episodes ?? [] },
-            ])
-          ) as Record<string, ProjectData>;
-          setProjects(normalizedProjects);
-
-
-
-          const selected =
-
-
-
-            parsed.currentProject && normalizedProjects[parsed.currentProject]
-
-
-
-              ? parsed.currentProject
-
-
-
-              : Object.keys(normalizedProjects)[0];
-
-
-
-          setProjectName(selected);
-
-
-
+        while (nextProjects[key]) {
+          key = `${anime.title} (${suffix})`;
+          suffix++;
         }
 
+        nextProjects[key] = {
+          ...EMPTY_PROJECT,
+          context: anime.story_context ?? "",
+        };
 
-
+        nextAnimeIds[key] = anime.id;
       }
 
+      setProjects(nextProjects);
+      setAnimeIds(nextAnimeIds);
 
-
+      const firstProject = Object.keys(nextProjects)[0] ?? "";
+      setProjectName(firstProject);
     } catch (err) {
+      console.error("Could not load anime projects:", err);
 
-
-
-      console.error("Could not load saved projects:", err);
-
-
-
+      if (!cancelled) {
+        setError(
+          err instanceof Error
+            ? err.message
+            : "ไม่สามารถโหลดโปรเจกต์จากฐานข้อมูลได้"
+        );
+      }
     } finally {
-
-
-
-      setHydrated(true);
-
-
-
+      if (!cancelled) {
+        setHydrated(true);
+      }
     }
+  }
 
+  loadProjects();
 
-
-  }, []);
+  return () => {
+    cancelled = true;
+  };
+}, []);
 
 
 
@@ -547,33 +683,59 @@ const translatedCount = Object.keys(translations).length;
     };
   }, [videoUrl]);
 
-  // Restore subtitle appearance preferences from this browser.
-  useEffect(() => {
-    try {
-      const savedSettings = localStorage.getItem("anime-subtitle-translator-video-settings-v1");
-      if (savedSettings) {
-        const parsed = JSON.parse(savedSettings) as Partial<VideoSubtitleSettings>;
-        setSubtitleSettings({ ...DEFAULT_VIDEO_SUBTITLE_SETTINGS, ...parsed });
-      }
-    } catch (storageError) {
-      console.warn("Unable to load subtitle settings", storageError);
-    } finally {
-      setSubtitleSettingsHydrated(true);
-    }
-  }, []);
+ // Load subtitle appearance preferences from Supabase.
+useEffect(() => {
+  let cancelled = false;
 
-  // Save every adjustment so it is restored the next time the app is opened.
-  useEffect(() => {
-    if (!subtitleSettingsHydrated) return;
+  async function loadSettings() {
     try {
-      localStorage.setItem(
-        "anime-subtitle-translator-video-settings-v1",
-        JSON.stringify(subtitleSettings)
-      );
-    } catch (storageError) {
-      console.warn("Unable to save subtitle settings", storageError);
+      const saved = await getVideoSettings();
+
+      if (
+        !cancelled &&
+        saved?.settings &&
+        typeof saved.settings === "object"
+      ) {
+        setSubtitleSettings({
+          ...DEFAULT_VIDEO_SUBTITLE_SETTINGS,
+          ...saved.settings,
+        });
+      }
+    } catch (err) {
+      console.error("Could not load video settings:", err);
+      if (!cancelled) {
+        setError("ไม่สามารถโหลดการตั้งค่าซับจากฐานข้อมูลได้");
+      }
+    } finally {
+      if (!cancelled) {
+        setSubtitleSettingsHydrated(true);
+      }
     }
-  }, [subtitleSettings, subtitleSettingsHydrated]);
+  }
+
+  loadSettings();
+
+  return () => {
+    cancelled = true;
+  };
+}, []);
+
+// Save subtitle settings to Supabase.
+useEffect(() => {
+  if (!subtitleSettingsHydrated) return;
+
+  const timer = setTimeout(async () => {
+    try {
+      await saveVideoSettings(subtitleSettings);
+    } catch (err) {
+      console.error("Could not save video settings:", err);
+      setError("ไม่สามารถบันทึกการตั้งค่าซับลงฐานข้อมูลได้");
+    }
+  }, 500);
+
+  return () => clearTimeout(timer);
+}, [subtitleSettings, subtitleSettingsHydrated]);
+
 
   function updateSubtitleSettings(patch: Partial<VideoSubtitleSettings>) {
     setSubtitleSettings((previous) => ({ ...previous, ...patch }));
@@ -582,51 +744,16 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-  // Persist all projects locally. No account or cloud storage is used.
 
 
 
-  useEffect(() => {
+  
 
 
-
-    if (!hydrated) return;
-
+   
 
 
-    try {
-
-
-
-      localStorage.setItem(
-
-
-
-        STORAGE_KEY,
-
-
-
-        JSON.stringify({ currentProject: projectName, projects })
-
-
-
-      );
-
-
-
-    } catch (err) {
-
-
-
-      console.error("Could not save projects:", err);
-
-
-
-    }
-
-
-
-  }, [projects, projectName, hydrated]);
+ 
 
 
 
@@ -634,214 +761,163 @@ const translatedCount = Object.keys(translations).length;
 
 
 
+  
   function updateActiveProject(patch: Partial<ProjectData>) {
-
-
-
     setProjects((previous) => ({
-
-
-
       ...previous,
-
-
-
       [projectName]: {
-
-
-
         ...(previous[projectName] ?? EMPTY_PROJECT),
-
-
-
         ...patch,
-
-
-
       },
-
-
-
     }));
-
-
-
   }
 
-
-
-
-
-
-
-  function createProject() {
-
-
-
+  async function createProject() {
     const name = window.prompt("ตั้งชื่อโปรเจกต์อนิเมะ");
-
-
-
     if (!name?.trim()) return;
 
-
-
     const cleanName = name.trim();
 
-
-
     if (projects[cleanName]) {
+      setProjectName(cleanName);
+      return;
+    }
 
+    try {
+      setError("");
 
+      const supabase = createClient();
+      const { data, error } = await supabase
+        .from("animes")
+        .insert({
+          title: cleanName,
+          story_context: "",
+        })
+        .select("id, title, story_context")
+        .single();
+
+      if (error) throw error;
+
+      setProjects((previous) => ({
+        ...previous,
+        [cleanName]: { ...EMPTY_PROJECT },
+      }));
+
+      setAnimeIds((previous) => ({
+        ...previous,
+        [cleanName]: data.id,
+      }));
 
       setProjectName(cleanName);
-
-
-
-      return;
-
-
-
+      setCharacterForm(null);
+      setGlossaryForm(null);
+    } catch (err) {
+      console.error("Create project error:", err);
+      setError(
+        err instanceof Error ? err.message : "สร้างโปรเจกต์ไม่สำเร็จ"
+      );
     }
-
-
-
-    setProjects((previous) => ({ ...previous, [cleanName]: { ...EMPTY_PROJECT } }));
-
-
-
-    setProjectName(cleanName);
-
-
-
-    setCharacterForm(null);
-
-
-
-    setGlossaryForm(null);
-
-
-
   }
 
-
-
-
-
-
-
-  function renameProject() {
-
-
-
+  async function renameProject() {
     const name = window.prompt("เปลี่ยนชื่อโปรเจกต์", projectName);
-
-
-
     if (!name?.trim() || name.trim() === projectName) return;
-
-
 
     const cleanName = name.trim();
 
-
-
     if (projects[cleanName]) {
-
-
-
       setError("มีโปรเจกต์ชื่อนี้อยู่แล้ว");
-
-
-
       return;
-
-
-
     }
 
+    const animeId = animeIds[projectName];
 
+    if (!animeId) {
+      setError("ไม่พบ ID ของโปรเจกต์");
+      return;
+    }
 
-    setProjects((previous) => {
+    try {
+      setError("");
 
+      const supabase = createClient();
+      const { error } = await supabase
+        .from("animes")
+        .update({ title: cleanName })
+        .eq("id", animeId);
 
+      if (error) throw error;
 
-      const next = { ...previous };
+      setProjects((previous) => {
+        const next = { ...previous };
+        next[cleanName] = next[projectName];
+        delete next[projectName];
+        return next;
+      });
 
+      setAnimeIds((previous) => {
+        const next = { ...previous };
+        next[cleanName] = next[projectName];
+        delete next[projectName];
+        return next;
+      });
 
-
-      next[cleanName] = next[projectName] ?? { ...EMPTY_PROJECT };
-
-
-
-      delete next[projectName];
-
-
-
-      return next;
-
-
-
-    });
-
-
-
-    setProjectName(cleanName);
-
-
-
+      setProjectName(cleanName);
+    } catch (err) {
+      console.error("Rename project error:", err);
+      setError(
+        err instanceof Error ? err.message : "เปลี่ยนชื่อโปรเจกต์ไม่สำเร็จ"
+      );
+    }
   }
 
-
-
-
-
-
-
-  function deleteProject() {
-
-
-
+  async function deleteProject() {
     if (Object.keys(projects).length <= 1) {
-
-
-
       setError("ต้องเหลืออย่างน้อยหนึ่งโปรเจกต์");
-
-
-
       return;
-
-
-
     }
 
+    if (
+      !window.confirm(
+        `ลบโปรเจกต์ "${projectName}" และข้อมูลที่เกี่ยวข้องทั้งหมดหรือไม่?`
+      )
+    ) {
+      return;
+    }
 
+    const animeId = animeIds[projectName];
 
-    if (!window.confirm(`ลบโปรเจกต์ "${projectName}" และข้อมูลตัวละคร/คำศัพท์ทั้งหมดหรือไม่?`)) return;
+    if (!animeId) {
+      setError("ไม่พบ ID ของโปรเจกต์");
+      return;
+    }
 
+    try {
+      setError("");
 
+      const supabase = createClient();
+      const { error } = await supabase
+        .from("animes")
+        .delete()
+        .eq("id", animeId);
 
-    const next = { ...projects };
+      if (error) throw error;
 
+      const nextProjects = { ...projects };
+      delete nextProjects[projectName];
 
+      const nextAnimeIds = { ...animeIds };
+      delete nextAnimeIds[projectName];
 
-    delete next[projectName];
-
-
-
-    const nextName = Object.keys(next)[0];
-
-
-
-    setProjects(next);
-
-
-
-    setProjectName(nextName);
-
-
-
+      setProjects(nextProjects);
+      setAnimeIds(nextAnimeIds);
+      setProjectName(Object.keys(nextProjects)[0]);
+    } catch (err) {
+      console.error("Delete project error:", err);
+      setError(
+        err instanceof Error ? err.message : "ลบโปรเจกต์ไม่สำเร็จ"
+      );
+    }
   }
 
 
@@ -1548,28 +1624,140 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-  function saveEpisode() {
+  
+  async function saveEpisode() {
     if (entries.length === 0) {
       setError("กรุณาเปิดไฟล์ SRT ก่อนบันทึกตอน");
       return;
     }
 
-    const suggestedTitle = fileName.replace(/\.srt$/i, "");
+    const animeId = animeIds[projectName];
+    if (!animeId) {
+      setError("ไม่พบโปรเจกต์ในฐานข้อมูล");
+      return;
+    }
+
+    const suggestedTitle = fileName.replace(/\\.srt$/i, "");
     const title = window.prompt("ตั้งชื่อตอน", suggestedTitle);
     if (!title?.trim()) return;
 
-    const episode: SavedEpisode = {
-      id: crypto.randomUUID(),
-      title: title.trim(),
-      fileName,
-      entries,
-      translations,
-      savedAt: new Date().toISOString(),
-    };
+    let createdEpisodeId: string | null = null;
 
-    updateActiveProject({ episodes: [...savedEpisodes, episode] });
-    setBackupMessage(`บันทึกตอน "${episode.title}" แล้ว`);
+    try {
+      setError("");
+      const supabase = createClient();
+
+      // episodes ต้องผูกกับ season ผ่าน season_id
+      // ใช้ซีซันแรกของอนิเมะนี้ หรือสร้างให้หากยังไม่มี
+      const { data: existingSeason, error: seasonLookupError } = await supabase
+        .from("seasons")
+        .select("id")
+        .eq("anime_id", animeId)
+        .order("season_number", { ascending: true })
+        .limit(1)
+        .maybeSingle();
+
+      if (seasonLookupError) throw seasonLookupError;
+
+      let seasonId = existingSeason?.id;
+
+      if (!seasonId) {
+        const { data: newSeason, error: seasonCreateError } = await supabase
+          .from("seasons")
+          .insert({
+            anime_id: animeId,
+            season_number: 1,
+            title: "ซีซัน 1",
+          })
+          .select("id")
+          .single();
+
+        if (seasonCreateError) throw seasonCreateError;
+        seasonId = newSeason.id;
+      }
+
+      // สร้างข้อมูลตอน โดยผูกกับซีซันจริง ไม่ส่ง season_id เป็น null
+      const { data: episodeData, error: episodeError } = await supabase
+        .from("episodes")
+        .insert({
+          season_id: seasonId,
+          episode_number: savedEpisodes.length + 1,
+          title: title.trim(),
+          file_name: fileName,
+          saved_at: new Date().toISOString(),
+        })
+        .select("id")
+        .single();
+
+      if (episodeError) throw episodeError;
+      createdEpisodeId = episodeData.id;
+
+      const subtitleRows = entries.map((entry) => ({
+        episode_id: episodeData.id,
+        subtitle_number: entry.id,
+        start_time: entry.start,
+        end_time: entry.end,
+        original_text: entry.text,
+        translated_text: translations[entry.id] ?? "",
+      }));
+
+      // บันทึกซับเป็นชุด ชุดละ 500 รายการ
+      for (let i = 0; i < subtitleRows.length; i += 500) {
+        const { error: subtitleError } = await supabase
+          .from("subtitles")
+          .insert(subtitleRows.slice(i, i + 500));
+
+        if (subtitleError) throw subtitleError;
+      }
+
+      const episode: SavedEpisode = {
+        id: episodeData.id,
+        title: title.trim(),
+        fileName,
+        entries,
+        translations,
+        savedAt: new Date().toISOString(),
+      };
+
+      updateActiveProject({
+        episodes: [...savedEpisodes, episode],
+      });
+
+      setBackupMessage(`บันทึกตอน "${episode.title}" เรียบร้อยแล้ว`);
+    } catch (err) {
+      const dbError = err as {
+        message?: string;
+        details?: string;
+        hint?: string;
+        code?: string;
+      };
+
+      const errorMessage = [
+        dbError?.message,
+        dbError?.details,
+        dbError?.hint,
+        dbError?.code ? `รหัสข้อผิดพลาด: ${dbError.code}` : "",
+      ].filter(Boolean).join("\\n") || (err instanceof Error ? err.message : "ไม่ทราบสาเหตุ");
+
+      console.error("Save episode error:", err);
+
+      // หากบันทึกซับไม่สำเร็จ ให้ลบตอนที่สร้างไว้เพื่อไม่ให้เหลือข้อมูลค้าง
+      if (createdEpisodeId) {
+        const supabase = createClient();
+        const { error: cleanupError } = await supabase
+          .from("episodes")
+          .delete()
+          .eq("id", createdEpisodeId);
+
+        if (cleanupError) {
+          console.error("Episode cleanup error:", cleanupError);
+        }
+      }
+
+      setError(`บันทึกตอนไม่สำเร็จ: ${errorMessage}`);
+    }
   }
+
 
   function loadEpisode(episode: SavedEpisode) {
     if (entries.length > 0 && !window.confirm("โหลดตอนนี้แทนงานที่เปิดอยู่หรือไม่? งานที่ยังไม่ได้บันทึกจะถูกแทนที่")) {
@@ -1589,11 +1777,37 @@ const translatedCount = Object.keys(translations).length;
     setBackupMessage(`โหลดตอน "${episode.title}" แล้ว`);
   }
 
-  function deleteEpisode(episodeId: string) {
+ 
+  async function deleteEpisode(episodeId: string) {
     const episode = savedEpisodes.find((item) => item.id === episodeId);
-    if (!episode || !window.confirm(`ลบตอน "${episode.title}" หรือไม่?`)) return;
-    updateActiveProject({ episodes: savedEpisodes.filter((item) => item.id !== episodeId) });
+
+    if (!episode || !window.confirm(`ลบตอน "${episode.title}" หรือไม่?`)) {
+      return;
+    }
+
+    try {
+      setError("");
+
+      const supabase = createClient();
+
+      const { error } = await supabase
+        .from("episodes")
+        .delete()
+        .eq("id", episodeId);
+
+      if (error) throw error;
+
+      updateActiveProject({
+        episodes: savedEpisodes.filter((item) => item.id !== episodeId),
+      });
+
+      setBackupMessage(`ลบตอน "${episode.title}" เรียบร้อยแล้ว`);
+    } catch (err) {
+      console.error("Delete episode error:", err);
+      setError("ลบตอนไม่สำเร็จ");
+    }
   }
+
 
   function reset() {
 
@@ -1643,84 +1857,150 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-  function saveCharacter() {
-
-
-
+  
+  async function saveCharacter() {
     if (!characterForm?.name.trim()) return;
 
+    const animeId = animeIds[projectName];
+    if (!animeId) {
+      setError("ไม่พบโปรเจกต์ในฐานข้อมูล");
+      return;
+    }
 
+    try {
+      setError("");
+      const supabase = createClient();
 
-    const exists = activeProject.characters.some((item) => item.id === characterForm.id);
+      const { error } = await supabase
+        .from("characters")
+        .upsert({
+          id: characterForm.id,
+          anime_id: animeId,
+          name: characterForm.name.trim(),
+          description: characterForm.description,
+          pronoun: characterForm.pronoun,
+          speech_style: characterForm.speakingStyle,
+          relationships: characterForm.relationships,
+        }, { onConflict: "id" });
 
+      if (error) throw error;
 
+      const exists = activeProject.characters.some(
+        (item) => item.id === characterForm.id
+      );
 
-    const characters = exists
+      const characters = exists
+        ? activeProject.characters.map((item) =>
+            item.id === characterForm.id ? characterForm : item
+          )
+        : [...activeProject.characters, characterForm];
 
-
-
-      ? activeProject.characters.map((item) => item.id === characterForm.id ? characterForm : item)
-
-
-
-      : [...activeProject.characters, characterForm];
-
-
-
-    updateActiveProject({ characters });
-
-
-
-    setCharacterForm(null);
-
-
-
+      updateActiveProject({ characters });
+      setCharacterForm(null);
+      setBackupMessage("บันทึกข้อมูลตัวละครเรียบร้อยแล้ว");
+    } catch (err) {
+      const dbError = err as { message?: string };
+      setError(dbError?.message || (err instanceof Error ? err.message : "บันทึกตัวละครไม่สำเร็จ"));
+      console.error("Save character error:", err);
+    }
   }
 
+  async function deleteCharacter(characterId: string) {
+    if (!window.confirm("ต้องการลบตัวละครนี้หรือไม่?")) return;
 
+    try {
+      const supabase = createClient();
+      const { error } = await supabase
+        .from("characters")
+        .delete()
+        .eq("id", characterId);
 
+      if (error) throw error;
 
-
-
-
-  function saveGlossary() {
-
-
-
-    if (!glossaryForm?.original.trim() || !glossaryForm.translation.trim()) return;
-
-
-
-    const exists = activeProject.glossary.some((item) => item.id === glossaryForm.id);
-
-
-
-    const glossary = exists
-
-
-
-      ? activeProject.glossary.map((item) => item.id === glossaryForm.id ? glossaryForm : item)
-
-
-
-      : [...activeProject.glossary, glossaryForm];
-
-
-
-    updateActiveProject({ glossary });
-
-
-
-    setGlossaryForm(null);
-
-
-
+      updateActiveProject({
+        characters: activeProject.characters.filter(
+          (item) => item.id !== characterId
+        ),
+      });
+      setBackupMessage("ลบตัวละครเรียบร้อยแล้ว");
+    } catch (err) {
+      const dbError = err as { message?: string };
+      setError(dbError?.message || "ลบตัวละครไม่สำเร็จ");
+      console.error("Delete character error:", err);
+    }
   }
 
+  async function saveGlossary() {
+    if (!glossaryForm?.original.trim() || !glossaryForm.translation.trim()) {
+      return;
+    }
 
+    const animeId = animeIds[projectName];
+    if (!animeId) {
+      setError("ไม่พบโปรเจกต์ในฐานข้อมูล");
+      return;
+    }
 
+    try {
+      setError("");
+      const supabase = createClient();
 
+      const { error } = await supabase
+        .from("glossary")
+        .upsert({
+          id: glossaryForm.id,
+          anime_id: animeId,
+          source_term: glossaryForm.original.trim(),
+          translated_term: glossaryForm.translation.trim(),
+          note: glossaryForm.note,
+        }, { onConflict: "id" });
 
+      if (error) throw error;
+
+      const exists = activeProject.glossary.some(
+        (item) => item.id === glossaryForm.id
+      );
+
+      const glossary = exists
+        ? activeProject.glossary.map((item) =>
+            item.id === glossaryForm.id ? glossaryForm : item
+          )
+        : [...activeProject.glossary, glossaryForm];
+
+      updateActiveProject({ glossary });
+      setGlossaryForm(null);
+      setBackupMessage("บันทึกคำศัพท์เรียบร้อยแล้ว");
+    } catch (err) {
+      const dbError = err as { message?: string };
+      setError(dbError?.message || (err instanceof Error ? err.message : "บันทึกคำศัพท์ไม่สำเร็จ"));
+      console.error("Save glossary error:", err);
+    }
+  }
+
+  async function deleteGlossaryItem(itemId: string) {
+    if (!window.confirm("ต้องการลบคำศัพท์นี้หรือไม่?")) return;
+
+    try {
+      const supabase = createClient();
+      const { error } = await supabase
+        .from("glossary")
+        .delete()
+        .eq("id", itemId);
+
+      if (error) throw error;
+
+      updateActiveProject({
+        glossary: activeProject.glossary.filter(
+          (item) => item.id !== itemId
+        ),
+      });
+      setBackupMessage("ลบคำศัพท์เรียบร้อยแล้ว");
+    } catch (err) {
+      const dbError = err as { message?: string };
+      setError(dbError?.message || "ลบคำศัพท์ไม่สำเร็จ");
+      console.error("Delete glossary error:", err);
+    }
+  }
 
 
   const inputClass = "w-full rounded-lg border border-white/10 bg-black/30 px-3 py-2.5 text-sm text-white outline-none placeholder:text-gray-600 focus:border-violet-500";
@@ -2179,7 +2459,7 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-                          <button title="ลบ" onClick={() => updateActiveProject({ characters: activeProject.characters.filter((item) => item.id !== character.id) })} className="rounded p-2 text-gray-400 hover:bg-red-500/10 hover:text-red-400"><Trash2 size={15} /></button>
+                          <button title="ลบ" onClick={() => deleteCharacter(character.id)} className="rounded p-2 text-gray-400 hover:bg-red-500/10 hover:text-red-400"><Trash2 size={15} /></button>
 
 
 
@@ -2351,7 +2631,7 @@ const translatedCount = Object.keys(translations).length;
 
 
 
-                        <button title="ลบ" onClick={() => updateActiveProject({ glossary: activeProject.glossary.filter((entry) => entry.id !== item.id) })} className="rounded p-2 text-gray-400 hover:bg-red-500/10 hover:text-red-400"><Trash2 size={15} /></button>
+                        <button title="ลบ" onClick={() => deleteGlossaryItem(item.id)} className="rounded p-2 text-gray-400 hover:bg-red-500/10 hover:text-red-400"><Trash2 size={15} /></button>
 
 
 
